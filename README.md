@@ -1,10 +1,10 @@
 # Rusql: A Modern MySQL Client in Rust 🦀
-This is a forked vnd improved version from https://github.com/tristanpoland/Rusql. Thanks tristanpoland
+This is a forked and improved version from https://github.com/tristanpoland/Rusql. Thanks tristanpoland
 the software hars following improvement
-1.add vertical output for the query result
-2.make table output more clear
-3.add colorful output for the query result for select. the where column color support red or green.
-4.support tab completion for command and sql key word
+- 1.add vertical output for the query result
+- 2.make table output more clear
+- 3.add colorful output for the query result for select. the where column color support red or green.
+- 4.support tab completion for command and sql key word
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
