@@ -981,18 +981,25 @@ impl MySQLClient {
     fn print_output(&self, output: &str) {
         match &self.pager_command {
             Some(cmd) => {
-                use std::io::Write;
-                use std::process::{Command, Stdio};
-                if let Ok(mut child) = Command::new("sh")
-                    .args(["-c", cmd])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::inherit())
-                    .spawn()
-                {
-                    if let Some(ref mut stdin) = child.stdin {
-                        let _ = stdin.write_all(output.as_bytes());
+                let term_height = term_size::dimensions()
+                    .map(|(_, h)| h)
+                    .unwrap_or(24);
+                let line_count = output.lines().count();
+
+                if line_count >= term_height {
+                    use std::io::Write;
+                    use std::process::{Command, Stdio};
+                    if let Ok(mut child) = Command::new("sh")
+                        .args(["-c", cmd])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::inherit())
+                        .spawn()
+                    {
+                        if let Some(ref mut stdin) = child.stdin {
+                            let _ = stdin.write_all(output.as_bytes());
+                        }
+                        let _ = child.wait();
                     }
-                    let _ = child.wait();
                 }
                 print!("{}", output);
             }
