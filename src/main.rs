@@ -645,26 +645,31 @@ impl MySQLClient {
             Vec::new()
         };
 
-        let affected_rows = self.conn.affected_rows();
-        let result = self.conn.query_iter(query)?;
-        let column_info = result.columns().as_ref().to_vec();
+        let rows: Vec<mysql::Row> = self.conn.query(query)?;
+
+        let column_info = rows.first()
+            .map(|r| r.columns_ref().to_vec())
+            .unwrap_or_default();
 
         if column_info.is_empty() {
             let elapsed = start_time.elapsed();
-
-            if affected_rows > 0 {
-                let msg = format!(
-                    "Query OK, {} {} affected ({:.2} sec)",
-                    affected_rows,
-                    if affected_rows == 1 { "row" } else { "rows" },
-                    elapsed.as_secs_f64()
-                );
+            if is_select {
+                let msg = format!("Empty set ({:.2} sec)", elapsed.as_secs_f64());
                 println!("{}", if use_colors { msg.green().to_string() } else { msg });
+            } else {
+                let affected_rows = self.conn.affected_rows();
+                if affected_rows > 0 {
+                    let msg = format!(
+                        "Query OK, {} {} affected ({:.2} sec)",
+                        affected_rows,
+                        if affected_rows == 1 { "row" } else { "rows" },
+                        elapsed.as_secs_f64()
+                    );
+                    println!("{}", if use_colors { msg.green().to_string() } else { msg });
+                }
             }
             return Ok(None);
         }
-
-        let rows: Vec<mysql::Row> = result.collect::<Result<Vec<_>, _>>()?;
 
         let num_cols = column_info.len();
         let term_width = term_size::dimensions()
