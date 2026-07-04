@@ -148,18 +148,17 @@ impl Completer for SqlCompleter {
         pos: usize,
         _ctx: &Context<'_>,
     ) -> Result<(usize, Vec<Pair>), ReadlineError> {
-        let upper = line[..pos].to_uppercase();
         let tokens: Vec<&str> = line[..pos].split_whitespace().collect();
         let last_token = tokens.last().copied().unwrap_or("");
         let start = pos - last_token.len();
 
         let last_upper = last_token.to_uppercase();
-        let prev_upper = tokens.len().checked_sub(1)
+        let prev_upper = tokens.len().checked_sub(2)
             .and_then(|i| tokens.get(i))
             .map(|s| s.to_uppercase())
             .unwrap_or_default();
 
-        let candidates: Vec<String> = if prev_upper == "USE" || prev_upper == "FROM" && upper.contains("USE ") {
+        let candidates: Vec<String> = if prev_upper == "USE" {
             self.databases.iter()
                 .filter(|d| d.to_uppercase().starts_with(&last_upper))
                 .cloned().collect()
