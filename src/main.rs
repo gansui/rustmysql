@@ -197,7 +197,7 @@ impl Completer for SqlCompleter {
 
         let pairs: Vec<Pair> = candidates.into_iter().map(|s| Pair {
             display: s.clone(),
-            replacement: s,
+            replacement: format!("{} ", s),
         }).collect();
 
         Ok((start, pairs))
