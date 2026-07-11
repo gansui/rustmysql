@@ -3,16 +3,21 @@ use mysql::prelude::*;
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::completion::{Completer, Pair};
+use rustyline::config::Configurer;
 use rustyline::Context;
 use std::borrow::Cow;
 use structopt::StructOpt;
 use prettytable::{Table, Row as PrettyRow, Cell, format};
 use std::error::Error;
 use std::path::PathBuf;
+use std::fs::{OpenOptions, remove_file};
+use std::io::{Write, BufRead, BufReader};
+use std::time::{SystemTime, UNIX_EPOCH};
 use dirs::home_dir;
 use colored::*;
 use regex::Regex;
 use unicode_width::UnicodeWidthStr;
+use fd_lock::RwLock;
 
 fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
@@ -69,6 +74,7 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
 enum DisplayMode {
     Vertical,
     Mline(usize),
+    Raw,
 }
 
 #[derive(Clone)]
@@ -274,6 +280,224 @@ const BUILDIN_COMMAND: &[&str] = &[
     "help", "quit", "exit", "clear", "status", "use",
     "source", "connect", "pager", "nopager", "ego", "color", "newline",
 ];
+
+/// 历史记录配置
+struct HistoryConfig {
+    /// 最大保存条数
+    max_entries: usize,
+    /// 搜索时显示的最大条数
+    search_display_limit: usize,
+    /// 自动清理阈值（超过时触发清理）
+    cleanup_threshold: usize,
+    /// 每N条命令保存一次
+    save_interval: usize,
+    /// 保存时间间隔（秒）
+    save_interval_secs: u64,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 1000,
+            search_display_limit: 100,
+            cleanup_threshold: 1200,
+            save_interval: 10,
+            save_interval_secs: 300,  // 5分钟
+        }
+    }
+}
+
+/// 历史记录管理器
+struct HistoryManager {
+    /// 历史记录文件路径
+    file_path: PathBuf,
+    /// 锁文件路径
+    lock_path: PathBuf,
+    /// 配置
+    config: HistoryConfig,
+    /// 内存中的历史记录
+    entries: Vec<String>,
+    /// 命令计数器（用于定期保存）
+    command_count: usize,
+    /// 上次保存时间戳
+    last_save_time: u64,
+}
+
+impl HistoryManager {
+    /// 创建新的历史记录管理器
+    fn new(file_path: PathBuf, config: HistoryConfig) -> Self {
+        let lock_path = file_path.with_extension("history.lock");
+        
+        Self {
+            file_path,
+            lock_path,
+            config,
+            entries: Vec::new(),
+            command_count: 0,
+            last_save_time: 0,
+        }
+    }
+    
+    /// 初始化：加载历史记录
+    fn init(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.file_path.exists() {
+            let file = OpenOptions::new()
+                .read(true)
+                .open(&self.file_path)?;
+            
+            let reader = BufReader::new(file);
+            self.entries = reader
+                .lines()
+                .filter_map(|l| l.ok())
+                .filter(|l| !l.trim().is_empty())
+                .collect();
+            
+            // 限制加载条数
+            if self.entries.len() > self.config.max_entries {
+                let split_at = self.entries.len() - self.config.max_entries;
+                self.entries = self.entries.split_off(split_at);
+            }
+        }
+        
+        // 初始化上次保存时间
+        self.last_save_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        Ok(())
+    }
+    
+    /// 添加命令到历史记录
+    fn add_command(&mut self, command: &str) {
+        // 过滤空命令
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        
+        // 避免连续重复相同的命令
+        if self.entries.last().map_or(true, |last| last != trimmed) {
+            self.entries.push(trimmed.to_string());
+        }
+        
+        self.command_count += 1;
+        
+        // 检查是否需要保存
+        if self.should_save() {
+            self.save().ok();  // 保存失败不中断程序
+        }
+    }
+    
+    /// 判断是否需要保存
+    fn should_save(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // 条件1：达到保存间隔
+        if self.command_count >= self.config.save_interval {
+            return true;
+        }
+        
+        // 条件2：超过保存时间间隔
+        if now.saturating_sub(self.last_save_time) >= self.config.save_interval_secs {
+            return true;
+        }
+        
+        // 条件3：超过清理阈值
+        if self.entries.len() >= self.config.cleanup_threshold {
+            return true;
+        }
+        
+        false
+    }
+    
+    /// 保存历史记录（使用非阻塞锁）
+    fn save(&mut self) -> Result<(), Box<dyn Error>> {
+        // 清理旧记录
+        self.cleanup();
+        
+        // 尝试获取锁文件
+        let lock_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.lock_path)?;
+        
+        // 使用非阻塞锁，获取不到就跳过本次保存
+        let mut lock = RwLock::new(lock_file);
+        let locked_file = match lock.try_write() {
+            Ok(f) => f,
+            Err(_) => return Ok(()),  // 其他进程正在写入，跳过
+        };
+        
+        // 写入历史记录文件
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.file_path)?;
+        
+        for entry in &self.entries {
+            writeln!(file, "{}", entry)?;
+        }
+        
+        // 更新状态
+        self.command_count = 0;
+        self.last_save_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // 释放锁（文件关闭时自动释放）
+        drop(locked_file);
+        
+        Ok(())
+    }
+    
+    /// 清理旧记录，只保留最后N条
+    fn cleanup(&mut self) {
+        if self.entries.len() > self.config.max_entries {
+            let split_at = self.entries.len() - self.config.max_entries;
+            self.entries = self.entries.split_off(split_at);
+        }
+    }
+    
+    /// 强制保存（退出时调用）
+    fn force_save(&mut self) -> Result<(), Box<dyn Error>> {
+        self.cleanup();
+        
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.file_path)?;
+        
+        for entry in &self.entries {
+            writeln!(file, "{}", entry)?;
+        }
+        
+        // 删除锁文件
+        remove_file(&self.lock_path).ok();
+        
+        Ok(())
+    }
+    
+    /// 获取最后N条历史记录（用于加载到rustyline）
+    fn get_recent(&self, limit: usize) -> Vec<String> {
+        self.entries.iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+    
+}
 
 impl MySQLClient {
     fn new(opts: &Opts) -> Result<Self, Box<dyn Error>> {
@@ -579,12 +803,13 @@ impl MySQLClient {
                 let current_mode_str = match self.display_mode {
                     DisplayMode::Vertical => "vertical".to_string(),
                     DisplayMode::Mline(n) => format!("line({})", n),
+                    DisplayMode::Raw => "raw".to_string(),
                 };
                 let arg = stripped.split_whitespace().nth(1);
                 match arg {
                     Some("v") | Some("vertical") => {
                         self.display_mode = DisplayMode::Vertical;
-                        let msg = format!("Display mode: vertical (was: {}, available: vertical, line [N])", current_mode_str);
+                        let msg = format!("Display mode: vertical (was: {}, available: vertical, line [N], raw)", current_mode_str);
                         println!("{}", if self.use_colors { msg.green().to_string() } else { msg });
                     }
                     Some("l") | Some("line") | Some("m") | Some("mline") => {
@@ -593,26 +818,33 @@ impl MySQLClient {
                             .unwrap_or(1)
                             .min(10).max(1);
                         self.display_mode = DisplayMode::Mline(n);
-                        let msg = format!("Display mode: line({}) (was: {}, available: vertical, line [N])", n, current_mode_str);
+                        let msg = format!("Display mode: line({}) (was: {}, available: vertical, line [N], raw)", n, current_mode_str);
+                        println!("{}", if self.use_colors { msg.green().to_string() } else { msg });
+                    }
+                    Some("r") | Some("raw") => {
+                        self.display_mode = DisplayMode::Raw;
+                        let msg = format!("Display mode: raw (was: {}, available: vertical, line [N], raw)", current_mode_str);
                         println!("{}", if self.use_colors { msg.green().to_string() } else { msg });
                     }
                     None => {
                         self.display_mode = match self.display_mode {
                             DisplayMode::Vertical => DisplayMode::Mline(1),
-                            DisplayMode::Mline(_) => DisplayMode::Vertical,
+                            DisplayMode::Mline(_) => DisplayMode::Raw,
+                            DisplayMode::Raw => DisplayMode::Vertical,
                         };
                         let new_mode_str = match self.display_mode {
                             DisplayMode::Vertical => "vertical".to_string(),
                             DisplayMode::Mline(n) => format!("line({})", n),
+                            DisplayMode::Raw => "raw".to_string(),
                         };
-                        let msg = format!("Display mode: {} (was: {}, available: vertical, line [N])", new_mode_str, current_mode_str);
+                        let msg = format!("Display mode: {} (was: {}, available: vertical, line [N], raw)", new_mode_str, current_mode_str);
                         println!("{}", if self.use_colors { msg.green().to_string() } else { msg });
                     }
                     _ => {
                         println!("{}", if self.use_colors {
-                            "Usage: ego [vertical|line [N]]".bright_yellow().to_string()
+                            "Usage: ego [vertical|line [N]|raw]".bright_yellow().to_string()
                         } else {
-                            "Usage: ego [vertical|line [N]]".to_string()
+                            "Usage: ego [vertical|line [N]|raw]".to_string()
                         });
                     }
                 }
@@ -883,6 +1115,58 @@ impl MySQLClient {
                     is_vertical: true,
                 }));
             }
+            DisplayMode::Raw => {
+                let row_count = rows.len();
+                let mut out = String::new();
+                
+                // 输出表头（字段名用|分隔）
+                let header: Vec<String> = column_info.iter()
+                    .map(|c| c.name_str().to_string())
+                    .collect();
+                if use_colors {
+                    out.push_str(&header.join("|").bright_cyan().to_string());
+                } else {
+                    out.push_str(&header.join("|"));
+                }
+                out.push('\n');
+                
+                // 输出每行数据（字段值用|分隔）
+                for row in &rows {
+                    let values: Vec<String> = (0..num_cols)
+                        .map(|i| {
+                            let (value, is_null) = Self::get_cell_value(row, i);
+                            if is_null {
+                                "NULL".to_string()
+                            } else {
+                                value
+                            }
+                        })
+                        .collect();
+                    out.push_str(&values.join("|"));
+                    out.push('\n');
+                }
+                
+                let elapsed = start_time.elapsed();
+                let summary = format!(
+                    "{} {} in set ({:.2} sec)",
+                    row_count,
+                    if row_count == 1 { "row" } else { "rows" },
+                    elapsed.as_secs_f64()
+                );
+                
+                if use_colors {
+                    out.push_str(&format!("\n{}", summary.green()));
+                } else {
+                    out.push_str(&format!("\n{}", summary));
+                }
+                
+                return Ok(Some(QueryResult {
+                    table: None,
+                    lines: vec![out],
+                    summary: String::new(),
+                    is_vertical: true,
+                }));
+            }
         }
     }
 
@@ -918,9 +1202,13 @@ impl MySQLClient {
             ("connect (\\r)", "Reconnect to the server"),
             ("pager (\\P)", "Set pager (none/less). Usage: pager less"),
             ("nopager (\\n)", "Disable pager"),
-            ("ego (\\G)", "Switch display mode: vertical|line [N]"),
+            ("ego (\\G)", "Switch display mode: vertical|line [N]|raw (e.g. ego raw)"),
             ("color", "Set highlight color: green|red (default: red)"),
             ("newline", "Set input mode: oneline|multiple (default: oneline)"),
+        ];
+
+        let extra_text = vec![
+            ("SQL || /path/to/file", "Execute SQL and output to file (append)"),
         ];
 
         println!();
@@ -938,6 +1226,24 @@ impl MySQLClient {
                 println!("  {:<width$}  {}", cmd.bright_cyan(), desc, width = max_len);
             } else {
                 println!("  {:<width$}  {}", cmd, desc, width = max_len);
+            }
+        }
+        
+        println!();
+        if use_colors {
+            println!("{}", "SQL output redirection:".bright_green());
+            println!();
+        } else {
+            println!("SQL output redirection:");
+            println!();
+        }
+        
+        let max_len_extra = extra_text.iter().map(|(cmd, _)| cmd.len()).max().unwrap_or(0);
+        for (cmd, desc) in &extra_text {
+            if use_colors {
+                println!("  {:<width$}  {}", cmd.bright_cyan(), desc, width = max_len_extra);
+            } else {
+                println!("  {:<width$}  {}", cmd, desc, width = max_len_extra);
             }
         }
         println!();
@@ -1169,14 +1475,28 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
         .unwrap_or_else(|| PathBuf::from(".mysql_history"));
 
+    // 初始化历史记录管理器
+    let mut history_manager = HistoryManager::new(
+        history_file.clone(),
+        HistoryConfig::default(),
+    );
+    if let Err(e) = history_manager.init() {
+        eprintln!("Warning: Failed to load history: {}", e);
+    }
+
     let helper = SqlHelper { completer: client.completer.clone() };
     let config = rustyline::config::Config::builder()
         .completion_type(rustyline::config::CompletionType::Circular)
         .build();
     let mut rl = Editor::with_config(config)?;
     rl.set_helper(Some(helper));
-    if rl.load_history(&history_file).is_err() {
-        println!("No previous history.");
+    
+    // 设置rustyline历史记录最大条数
+    rl.set_max_history_size(history_manager.config.max_entries)?;
+    
+    // 加载最近的历史记录到rustyline（用于上下键导航）
+    for entry in history_manager.get_recent(history_manager.config.search_display_limit) {
+        rl.add_history_entry(&entry)?;
     }
 
     print_welcome_message(&mut client);
@@ -1188,6 +1508,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         match rl.readline(&prompt) {
             Ok(line) => {
                 rl.add_history_entry(line.as_str())?;
+                history_manager.add_command(&line);
 
                 if line.trim().is_empty() {
                     continue;
@@ -1218,10 +1539,58 @@ fn main() -> Result<(), Box<dyn Error>> {
                 query_buffer.push(' ');
 
                 if effective_line.trim().ends_with(';') {
-                    println!("{}", client.highlight_sql_keywords(&query_buffer));
-                    match client.execute_query(&query_buffer) {
+                    // 检测 || filename 语法
+                    let (sql_query, output_file) = if let Some(pos) = query_buffer.find("||") {
+                        let sql_part = query_buffer[..pos].trim();
+                        let file_part = query_buffer[pos + 2..].trim();
+                        // 去掉文件名末尾的分号
+                        let file_part = file_part.trim_end_matches(';').trim();
+                        if !file_part.is_empty() {
+                            (sql_part.to_string(), Some(file_part.to_string()))
+                        } else {
+                            (query_buffer.clone(), None)
+                        }
+                    } else {
+                        (query_buffer.clone(), None)
+                    };
+                    
+                    println!("{}", client.highlight_sql_keywords(&sql_query));
+                    match client.execute_query(&sql_query) {
                         Ok(Some(result)) => {
-                            client.print_result(&result);
+                            if let Some(ref filename) = output_file {
+                                // 输出到文件
+                                use std::fs::OpenOptions;
+                                use std::io::Write;
+                                
+                                match OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(filename)
+                                {
+                                    Ok(mut file) => {
+                                        let output = client.result_to_string(&result);
+                                        if let Err(e) = file.write_all(output.as_bytes()) {
+                                            eprintln!("{}", if client.use_colors {
+                                                format!("Error writing to file: {}", e).bright_red().to_string()
+                                            } else {
+                                                format!("Error writing to file: {}", e)
+                                            });
+                                        } else {
+                                            let msg = format!("Output appended to '{}'", filename);
+                                            println!("{}", if client.use_colors { msg.green().to_string() } else { msg });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("{}", if client.use_colors {
+                                            format!("Error creating file '{}': {}", filename, e).bright_red().to_string()
+                                        } else {
+                                            format!("Error creating file '{}': {}", filename, e)
+                                        });
+                                    }
+                                }
+                            } else {
+                                client.print_result(&result);
+                            }
                         }
                         Ok(None) => {}
                         Err(ref e) if e.downcast_ref::<std::io::Error>()
@@ -1254,6 +1623,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    rl.save_history(&history_file)?;
+    // 强制保存历史记录
+    if let Err(e) = history_manager.force_save() {
+        eprintln!("Warning: Failed to save history: {}", e);
+    }
     exit_result
 }
